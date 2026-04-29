@@ -1,0 +1,779 @@
+# ============================================================
+# KSPHM-KIMM Bearing RUL Feature Extraction Final v2
+# TDMS -> Feature CSV
+#
+# 수정 반영:
+# 1) operation.csv 인코딩 오류 방지: utf-8-sig, utf-8, cp949, euc-kr, latin1 순차 시도
+# 2) TDMS 1개 = 1 row
+# 3) RMS/8 정규화 사용하지 않음
+# 4) 진동은 train별 초기 정상상태 baseline 대비 정규화
+# 5) 온도/토크는 종료조건 기준 정규화: temp/200, abs(torque)/20
+# 6) RPM 보정 BPFI/BPFO/BSF/Cage band energy 추가
+# 7) 최근 3개/6개 trend feature 추가
+# ============================================================
+
+import os
+import re
+import warnings
+import numpy as np
+import pandas as pd
+
+from nptdms import TdmsFile
+from tqdm import tqdm
+from scipy.stats import kurtosis, skew
+from scipy.signal import hilbert, butter, filtfilt
+from scipy.fft import rfft, rfftfreq
+import pywt
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 경로 설정
+# ============================================================
+
+BASE = r"C:\Users\leechaewon\Desktop\홍익대 자료\기데첼"
+
+TRAIN_FOLDERS = {
+    "Train1": os.path.join(BASE, "Train1_Vibration", "Train1_Vibration"),
+    "Train2": os.path.join(BASE, "Train2_Vibration", "Train2_Vibration"),
+    "Train3": os.path.join(BASE, "Train3_Vibration", "Train3_Vibration"),
+    "Train4": os.path.join(BASE, "Train4_Vibration", "Train4_Vibration"),
+}
+
+OUTPUT_DIR = os.path.join(BASE, "features_final")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+FS = 25600
+CHANNELS = ["CH1", "CH2", "CH3", "CH4"]
+
+# 1000 rpm 기준 베어링 결함 주파수
+FAULT_FREQ_1000RPM = {
+    "bpfi": 140.0,
+    "bpfo": 93.0,
+    "bsf": 78.0,
+    "cage": 6.7,
+}
+
+
+# ============================================================
+# 유틸
+# ============================================================
+
+def safe_div(a, b, eps=1e-10):
+    return a / (b + eps)
+
+
+def get_file_index(fname):
+    nums = re.findall(r"\d+", fname)
+    if not nums:
+        raise ValueError(f"파일명에서 숫자 index를 찾을 수 없음: {fname}")
+    return int(nums[-1])
+
+
+def find_group(tdms_file, preferred="Vibration"):
+    group_names = [g.name for g in tdms_file.groups()]
+    if preferred in group_names:
+        return tdms_file[preferred]
+    return tdms_file[group_names[0]]
+
+
+def get_channel_data(group, ch_name):
+    available = [c.name for c in group.channels()]
+    if ch_name in available:
+        return group[ch_name][:].astype(np.float64)
+
+    # 혹시 채널명이 /'CH1' 형태 등으로 들어온 경우 대비
+    for c in group.channels():
+        if ch_name.lower() in c.name.lower():
+            return c[:].astype(np.float64)
+
+    raise KeyError(f"{ch_name} 채널을 찾을 수 없음. 사용 가능 채널: {available}")
+
+
+def read_csv_safely(path):
+    """
+    operation.csv가 UTF-8이 아니라 CP949/EUC-KR인 경우를 대비.
+    """
+    encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin1"]
+
+    last_error = None
+    for enc in encodings:
+        try:
+            print(f"CSV 읽기 시도: {path} / encoding={enc}")
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
+
+    raise last_error
+
+
+# ============================================================
+# Feature 함수
+# ============================================================
+
+def time_domain_features(x, prefix):
+    x = np.asarray(x, dtype=np.float64)
+    abs_x = np.abs(x)
+
+    rms = np.sqrt(np.mean(x ** 2))
+    peak = np.max(abs_x)
+    mean_abs = np.mean(abs_x)
+
+    return {
+        f"{prefix}_mean": np.mean(x),
+        f"{prefix}_std": np.std(x),
+        f"{prefix}_var": np.var(x),
+        f"{prefix}_rms": rms,
+        f"{prefix}_log_rms": np.log(rms + 1e-10),
+        f"{prefix}_min": np.min(x),
+        f"{prefix}_max": np.max(x),
+        f"{prefix}_peak": peak,
+        f"{prefix}_peak_to_peak": np.max(x) - np.min(x),
+        f"{prefix}_mean_abs": mean_abs,
+        f"{prefix}_energy": np.sum(x ** 2),
+        f"{prefix}_skewness": skew(x),
+        f"{prefix}_kurtosis": kurtosis(x, fisher=True),
+        f"{prefix}_crest_factor": safe_div(peak, rms),
+        f"{prefix}_shape_factor": safe_div(rms, mean_abs),
+        f"{prefix}_impulse_factor": safe_div(peak, mean_abs),
+        f"{prefix}_clearance_factor": safe_div(
+            peak,
+            np.mean(np.sqrt(abs_x)) ** 2
+        ),
+        f"{prefix}_zero_cross_rate": np.mean(np.diff(np.signbit(x)) != 0),
+        f"{prefix}_q25": np.percentile(x, 25),
+        f"{prefix}_q75": np.percentile(x, 75),
+        f"{prefix}_iqr": np.percentile(x, 75) - np.percentile(x, 25),
+        f"{prefix}_mad": np.mean(np.abs(x - np.mean(x))),
+    }
+
+
+def frequency_features(x, prefix, fs=FS):
+    x = np.asarray(x, dtype=np.float64)
+    fft_vals = np.abs(rfft(x)) / len(x)
+    freqs = rfftfreq(len(x), d=1 / fs)
+
+    power = fft_vals ** 2
+    total_power = np.sum(power) + 1e-10
+
+    centroid = np.sum(freqs * power) / total_power
+    spread = np.sqrt(np.sum(((freqs - centroid) ** 2) * power) / total_power)
+    p_norm = power / total_power
+
+    # DC 제외 dominant freq
+    if len(fft_vals) > 1:
+        dom_idx = np.argmax(fft_vals[1:]) + 1
+    else:
+        dom_idx = 0
+
+    features = {
+        f"{prefix}_dom_freq": freqs[dom_idx],
+        f"{prefix}_dom_amp": fft_vals[dom_idx],
+        f"{prefix}_dom_ratio": safe_div(fft_vals[dom_idx], np.sum(fft_vals)),
+        f"{prefix}_spec_centroid": centroid,
+        f"{prefix}_spec_spread": spread,
+        f"{prefix}_spec_skew": np.sum(((freqs - centroid) ** 3) * power) / ((spread ** 3) * total_power + 1e-10),
+        f"{prefix}_spec_kurt": np.sum(((freqs - centroid) ** 4) * power) / ((spread ** 4) * total_power + 1e-10),
+        f"{prefix}_spec_entropy": -np.sum(p_norm * np.log(p_norm + 1e-10)),
+        f"{prefix}_spec_flatness": np.exp(np.mean(np.log(power + 1e-10))) / (np.mean(power) + 1e-10),
+        f"{prefix}_rms_freq": np.sqrt(np.sum((freqs ** 2) * power) / total_power),
+    }
+
+    bands = [
+        ("0_100", 0, 100),
+        ("100_500", 100, 500),
+        ("500_1k", 500, 1000),
+        ("1k_3k", 1000, 3000),
+        ("3k_5k", 3000, 5000),
+        ("5k_10k", 5000, 10000),
+        ("10k_12k8", 10000, 12800),
+    ]
+
+    for name, lo, hi in bands:
+        mask = (freqs >= lo) & (freqs < hi)
+        features[f"{prefix}_band_{name}_energy_ratio"] = np.sum(power[mask]) / total_power
+
+    return features
+
+
+def fault_frequency_features(x, prefix, rpm, fs=FS, bandwidth=5.0):
+    """
+    RPM 보정 결함 주파수 feature.
+    1000rpm 기준 주파수에 현재 rpm/1000을 곱함.
+    ±bandwidth Hz 주변 에너지 비율 추출.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    fft_vals = np.abs(rfft(x)) / len(x)
+    freqs = rfftfreq(len(x), d=1 / fs)
+
+    power = fft_vals ** 2
+    total_power = np.sum(power) + 1e-10
+
+    out = {}
+
+    if pd.isna(rpm) or rpm <= 0:
+        for fault_name in FAULT_FREQ_1000RPM:
+            for h in [1, 2, 3]:
+                out[f"{prefix}_{fault_name}_h{h}_freq"] = np.nan
+                out[f"{prefix}_{fault_name}_h{h}_energy_ratio"] = np.nan
+                out[f"{prefix}_{fault_name}_h{h}_peak_amp"] = np.nan
+        return out
+
+    for fault_name, base_freq in FAULT_FREQ_1000RPM.items():
+        f0 = base_freq * rpm / 1000.0
+
+        for h in [1, 2, 3]:
+            target = f0 * h
+            mask = (freqs >= target - bandwidth) & (freqs <= target + bandwidth)
+
+            if mask.sum() == 0:
+                energy_ratio = np.nan
+                peak_amp = np.nan
+            else:
+                energy_ratio = np.sum(power[mask]) / total_power
+                peak_amp = np.max(fft_vals[mask])
+
+            out[f"{prefix}_{fault_name}_h{h}_freq"] = target
+            out[f"{prefix}_{fault_name}_h{h}_energy_ratio"] = energy_ratio
+            out[f"{prefix}_{fault_name}_h{h}_peak_amp"] = peak_amp
+
+    return out
+
+
+def envelope_features(x, prefix, fs=FS):
+    """
+    베어링 결함 검출용 envelope feature.
+    필터 대역은 3000~10000Hz.
+    """
+    out = {}
+
+    try:
+        b, a = butter(4, [3000, 10000], btype="band", fs=fs)
+        filtered = filtfilt(b, a, x)
+        env = np.abs(hilbert(filtered))
+
+        env_rms = np.sqrt(np.mean(env ** 2))
+        env_peak = np.max(env)
+        env_fft = np.abs(rfft(env)) / len(env)
+        env_freqs = rfftfreq(len(env), d=1 / fs)
+        env_power = env_fft ** 2
+        total = np.sum(env_power) + 1e-10
+        p_norm = env_power / total
+
+        low_mask = env_freqs < 500
+        low_fft = env_fft.copy()
+        low_fft[~low_mask] = 0
+        peak_f = env_freqs[np.argmax(low_fft)]
+
+        out.update({
+            f"{prefix}_env_mean": np.mean(env),
+            f"{prefix}_env_std": np.std(env),
+            f"{prefix}_env_rms": env_rms,
+            f"{prefix}_env_peak": env_peak,
+            f"{prefix}_env_kurtosis": kurtosis(env, fisher=True),
+            f"{prefix}_env_skewness": skew(env),
+            f"{prefix}_env_crest_factor": safe_div(env_peak, env_rms),
+            f"{prefix}_env_energy": np.sum(env ** 2),
+            f"{prefix}_env_low_energy_ratio": np.sum(env_power[low_mask]) / total,
+            f"{prefix}_env_peak_freq": peak_f,
+            f"{prefix}_env_peak_amp": np.max(low_fft),
+            f"{prefix}_env_spec_centroid": np.sum(env_freqs * env_power) / total,
+            f"{prefix}_env_spec_entropy": -np.sum(p_norm * np.log(p_norm + 1e-10)),
+        })
+
+    except Exception:
+        keys = [
+            "env_mean", "env_std", "env_rms", "env_peak", "env_kurtosis",
+            "env_skewness", "env_crest_factor", "env_energy",
+            "env_low_energy_ratio", "env_peak_freq", "env_peak_amp",
+            "env_spec_centroid", "env_spec_entropy"
+        ]
+        for k in keys:
+            out[f"{prefix}_{k}"] = np.nan
+
+    return out
+
+
+def wavelet_features(x, prefix):
+    try:
+        coeffs = pywt.wavedec(x, "db4", level=4)
+        total_e = sum(np.sum(c ** 2) for c in coeffs) + 1e-10
+        labels = ["cA4", "cD4", "cD3", "cD2", "cD1"]
+
+        return {
+            f"{prefix}_wav_{labels[i]}_energy_ratio": np.sum(coeffs[i] ** 2) / total_e
+            for i in range(min(len(coeffs), len(labels)))
+        }
+
+    except Exception:
+        return {
+            f"{prefix}_wav_cA4_energy_ratio": np.nan,
+            f"{prefix}_wav_cD4_energy_ratio": np.nan,
+            f"{prefix}_wav_cD3_energy_ratio": np.nan,
+            f"{prefix}_wav_cD2_energy_ratio": np.nan,
+            f"{prefix}_wav_cD1_energy_ratio": np.nan,
+        }
+
+
+def cross_channel_features(ch_data):
+    pairs = [
+        ("CH1", "CH2"),
+        ("CH1", "CH3"),
+        ("CH1", "CH4"),
+        ("CH2", "CH3"),
+        ("CH2", "CH4"),
+        ("CH3", "CH4"),
+    ]
+
+    out = {}
+    for a, b in pairs:
+        try:
+            out[f"corr_{a}_{b}"] = np.corrcoef(ch_data[a], ch_data[b])[0, 1]
+        except Exception:
+            out[f"corr_{a}_{b}"] = np.nan
+
+    return out
+
+
+# ============================================================
+# TDMS 1개 처리
+# ============================================================
+
+def extract_features_from_tdms(file_path, rpm=np.nan):
+    tdms_file = TdmsFile.read(file_path)
+    group = find_group(tdms_file)
+
+    features = {}
+    ch_data = {}
+
+    for ch in CHANNELS:
+        x = get_channel_data(group, ch)
+        ch_data[ch] = x
+
+        features.update(time_domain_features(x, ch))
+        features.update(frequency_features(x, ch))
+        features.update(fault_frequency_features(x, ch, rpm=rpm))
+        features.update(envelope_features(x, ch))
+        features.update(wavelet_features(x, ch))
+
+        # 복합 feature
+        features[f"{ch}_kurtosis_x_rms"] = features[f"{ch}_kurtosis"] * features[f"{ch}_rms"]
+        features[f"{ch}_env_kurtosis_x_env_rms"] = features[f"{ch}_env_kurtosis"] * features[f"{ch}_env_rms"]
+
+    features.update(cross_channel_features(ch_data))
+
+    # 4채널 통합 feature
+    rms_cols = [features[f"{ch}_rms"] for ch in CHANNELS]
+    kurt_cols = [features[f"{ch}_kurtosis"] for ch in CHANNELS]
+    env_kurt_cols = [features[f"{ch}_env_kurtosis"] for ch in CHANNELS]
+    env_rms_cols = [features[f"{ch}_env_rms"] for ch in CHANNELS]
+
+    features["rms_all_mean"] = np.mean(rms_cols)
+    features["rms_all_max"] = np.max(rms_cols)
+    features["kurtosis_all_mean"] = np.mean(kurt_cols)
+    features["kurtosis_all_max"] = np.max(kurt_cols)
+    features["env_kurtosis_all_mean"] = np.mean(env_kurt_cols)
+    features["env_kurtosis_all_max"] = np.max(env_kurt_cols)
+    features["env_rms_all_mean"] = np.mean(env_rms_cols)
+    features["env_rms_all_max"] = np.max(env_rms_cols)
+
+    return features
+
+
+# ============================================================
+# Operation CSV 결합
+# ============================================================
+
+def load_operation_csv(train_name):
+    """
+    operation.csv 경로가 다를 수 있어서 후보 경로 여러 개 탐색.
+    인코딩 문제 방지를 위해 여러 encoding으로 시도.
+    """
+    candidates = [
+        os.path.join(BASE, f"{train_name}_operation.csv"),
+        os.path.join(BASE, f"{train_name}_Operation.csv"),
+        os.path.join(BASE, f"{train_name}_operation", "operation.csv"),
+        os.path.join(BASE, f"{train_name}_Operation", "operation.csv"),
+        os.path.join(BASE, train_name, "operation.csv"),
+        os.path.join(BASE, f"{train_name}_Vibration", "operation.csv"),
+        os.path.join(BASE, f"{train_name}_Vibration", f"{train_name}_operation.csv"),
+        os.path.join(BASE, f"{train_name}_Vibration", f"{train_name}_Operation.csv"),
+    ]
+
+    for path in candidates:
+        if os.path.exists(path):
+            print(f"operation.csv 발견: {path}")
+            op = read_csv_safely(path)
+            op.columns = [str(c).strip() for c in op.columns]
+            return op
+
+    print(f"{train_name}: operation.csv 없음. 진동 feature만 추출합니다.")
+    return None
+
+
+def standardize_operation_columns(op):
+    """
+    operation.csv 컬럼명이 정확히 다를 수 있으므로 최대한 자동 매핑.
+    """
+    if op is None:
+        return None
+
+    cols = op.columns.tolist()
+
+    def find_col(keywords):
+        for c in cols:
+            cl = str(c).lower()
+            if all(k.lower() in cl for k in keywords):
+                return c
+        return None
+
+    time_col = find_col(["time"]) or find_col(["sec"])
+    torque_col = find_col(["torque"])
+    rpm_col = find_col(["speed"]) or find_col(["rpm"])
+    front_col = find_col(["front"])
+    rear_col = find_col(["rear"])
+
+    rename = {}
+    if time_col:
+        rename[time_col] = "op_time_sec"
+    if torque_col:
+        rename[torque_col] = "op_torque_mean"
+    if rpm_col:
+        rename[rpm_col] = "op_rpm_mean"
+    if front_col:
+        rename[front_col] = "op_temp_front"
+    if rear_col:
+        rename[rear_col] = "op_temp_rear"
+
+    op = op.rename(columns=rename)
+
+    keep = [
+        c for c in [
+            "op_time_sec",
+            "op_torque_mean",
+            "op_rpm_mean",
+            "op_temp_front",
+            "op_temp_rear"
+        ]
+        if c in op.columns
+    ]
+
+    op = op[keep].copy()
+
+    # 숫자형 변환
+    for c in op.columns:
+        op[c] = pd.to_numeric(op[c], errors="coerce")
+
+    return op
+
+
+def attach_operation_features(df, op):
+    """
+    TDMS 측정 종료시간에 가장 가까운 operation row를 붙임.
+    operation.csv가 없으면 NaN으로 채움.
+    """
+    df = df.copy()
+
+    if op is None or "op_time_sec" not in op.columns:
+        for c in ["op_torque_mean", "op_rpm_mean", "op_temp_front", "op_temp_rear"]:
+            if c not in df.columns:
+                df[c] = np.nan
+        return df
+
+    op = op.dropna(subset=["op_time_sec"]).sort_values("op_time_sec").reset_index(drop=True)
+    df = df.sort_values("time_end_sec").reset_index(drop=True)
+
+    df = pd.merge_asof(
+        df,
+        op,
+        left_on="time_end_sec",
+        right_on="op_time_sec",
+        direction="nearest",
+        tolerance=600
+    )
+
+    for c in ["op_torque_mean", "op_rpm_mean", "op_temp_front", "op_temp_rear"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    return df
+
+
+# ============================================================
+# 후처리 feature: RUL, SI, RPM 정규화, slope
+# ============================================================
+
+def add_rul_label(df):
+    """
+    Q&A 기준: operation.csv 마지막 시간이 아니라 TDMS 기준으로 수명 산정.
+    마지막 TDMS 종료시각 = failure time.
+    RUL = failure_time - 현재 time_end_sec
+    """
+    df = df.copy()
+    failure_time = df["time_end_sec"].max()
+    df["failure_time_sec_tdms"] = failure_time
+    df["RUL_sec"] = failure_time - df["time_end_sec"]
+    return df
+
+
+def add_si_and_relative_features(df):
+    """
+    상태지수:
+    - 진동: 초기 정상상태 평균 대비 정규화
+    - 온도: 200℃ 기준
+    - 토크: 20Nm 기준
+    """
+    df = df.copy()
+
+    # RPM 그룹
+    df["rpm_group"] = (df["op_rpm_mean"] >= 850).astype("float")
+    df.loc[df["op_rpm_mean"].isna(), "rpm_group"] = np.nan
+
+    # train별 초기 6개 파일 baseline
+    for tid in df["train_id"].unique():
+        mask = df["train_id"] == tid
+        sub = df.loc[mask].sort_values("file_index")
+
+        # CH별 초기 RMS baseline
+        for ch in CHANNELS:
+            init_rms = sub[f"{ch}_rms"].iloc[:6].mean()
+            df.loc[mask, f"{ch}_rms_rel_init6"] = df.loc[mask, f"{ch}_rms"] / (init_rms + 1e-10)
+
+        init_rms_all = sub["rms_all_mean"].iloc[:6].mean()
+
+        df.loc[mask, "V_norm"] = df.loc[mask, "rms_all_mean"] / (init_rms_all + 1e-10)
+        df.loc[mask, "T_norm"] = df.loc[mask, "op_temp_front"] / 200.0
+        df.loc[mask, "Tor_norm"] = df.loc[mask, "op_torque_mean"].abs() / 20.0
+
+        df.loc[mask, "SI"] = (
+            1.0 * df.loc[mask, "V_norm"]
+            + 0.1 * df.loc[mask, "T_norm"]
+            + 0.1 * df.loc[mask, "Tor_norm"]
+        )
+
+        # RPM 그룹 내 초기값 대비 정규화
+        for grp in [0, 1]:
+            gmask = mask & (df["rpm_group"] == grp)
+            gsub = df.loc[gmask].sort_values("file_index")
+            if len(gsub) < 3:
+                continue
+
+            for ch in CHANNELS:
+                init_val = gsub[f"{ch}_rms"].iloc[:3].mean()
+                df.loc[gmask, f"{ch}_rms_rel_rpm_group"] = df.loc[gmask, f"{ch}_rms"] / (init_val + 1e-10)
+
+            init_env = gsub["env_rms_all_mean"].iloc[:3].mean()
+            df.loc[gmask, "env_rms_all_rel_rpm_group"] = df.loc[gmask, "env_rms_all_mean"] / (init_env + 1e-10)
+
+    return df
+
+
+def rolling_slope(values, window):
+    values = np.asarray(values, dtype=np.float64)
+    out = np.full(len(values), np.nan)
+
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        y = values[start:i + 1]
+
+        if len(y) < 3 or np.all(np.isnan(y)):
+            continue
+
+        x = np.arange(len(y))
+        valid = ~np.isnan(y)
+
+        if valid.sum() < 3:
+            continue
+
+        out[i] = np.polyfit(x[valid], y[valid], 1)[0]
+
+    return out
+
+
+def add_trend_features(df):
+    df = df.copy()
+    df = df.sort_values(["train_id", "file_index"]).reset_index(drop=True)
+
+    trend_cols = [
+        "rms_all_mean",
+        "rms_all_max",
+        "kurtosis_all_mean",
+        "env_kurtosis_all_max",
+        "env_rms_all_mean",
+        "SI",
+        "op_temp_front",
+        "op_temp_rear",
+        "op_torque_mean",
+    ]
+
+    # 결함주파수 대표 feature도 trend에 포함
+    for ch in CHANNELS:
+        for fault in ["bpfi", "bpfo", "bsf"]:
+            col = f"{ch}_{fault}_h1_energy_ratio"
+            if col in df.columns:
+                trend_cols.append(col)
+
+    for tid in df["train_id"].unique():
+        mask = df["train_id"] == tid
+        sub = df.loc[mask].sort_values("file_index")
+
+        for col in trend_cols:
+            if col not in df.columns:
+                continue
+
+            vals = sub[col].values
+            df.loc[sub.index, f"{col}_slope_3"] = rolling_slope(vals, 3)
+            df.loc[sub.index, f"{col}_slope_6"] = rolling_slope(vals, 6)
+
+            # 최근 3/6개 rolling mean도 추가
+            df.loc[sub.index, f"{col}_rollmean_3"] = pd.Series(vals).rolling(3, min_periods=1).mean().values
+            df.loc[sub.index, f"{col}_rollmean_6"] = pd.Series(vals).rolling(6, min_periods=1).mean().values
+
+    return df
+
+
+# ============================================================
+# Train 폴더 처리
+# ============================================================
+
+def process_train_folder(train_name, folder_path):
+    print(f"\n처리 시작: {train_name}")
+    print(f"경로: {folder_path}")
+
+    if not os.path.exists(folder_path):
+        print(f"폴더 없음: {folder_path}")
+        return None
+
+    tdms_files = sorted(
+        [f for f in os.listdir(folder_path) if f.lower().endswith(".tdms")],
+        key=get_file_index
+    )
+
+    if len(tdms_files) == 0:
+        print("TDMS 파일 없음")
+        return None
+
+    print(f"TDMS 파일 수: {len(tdms_files)}")
+
+    # operation 먼저 읽어서 rpm을 feature 추출에 활용
+    op_raw = load_operation_csv(train_name)
+    op = standardize_operation_columns(op_raw)
+
+    rows = []
+
+    for fname in tqdm(tdms_files, desc=train_name):
+        file_path = os.path.join(folder_path, fname)
+        file_idx = get_file_index(fname)
+
+        time_start = (file_idx - 1) * 600
+        time_end = (file_idx - 1) * 600 + 60
+
+        # rpm 추정: operation에서 가장 가까운 rpm 사용
+        rpm_for_fft = np.nan
+        if op is not None and "op_time_sec" in op.columns and "op_rpm_mean" in op.columns:
+            tmp = op.iloc[(op["op_time_sec"] - time_end).abs().argsort()[:1]]
+            if len(tmp) > 0:
+                rpm_for_fft = float(tmp["op_rpm_mean"].iloc[0])
+
+        try:
+            feats = extract_features_from_tdms(file_path, rpm=rpm_for_fft)
+            feats["train_id"] = train_name
+            feats["file_index"] = file_idx
+            feats["file_name"] = fname
+            feats["time_start_sec"] = time_start
+            feats["time_end_sec"] = time_end
+            rows.append(feats)
+
+        except Exception as e:
+            print(f"오류: {fname} / {e}")
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values("file_index").reset_index(drop=True)
+
+    # operation feature 결합
+    df = attach_operation_features(df, op)
+
+    # RUL label
+    df = add_rul_label(df)
+
+    return df
+
+
+# ============================================================
+# 전체 실행
+# ============================================================
+
+def main():
+    all_dfs = []
+
+    for train_name, folder_path in TRAIN_FOLDERS.items():
+        df = process_train_folder(train_name, folder_path)
+
+        if df is None or len(df) == 0:
+            continue
+
+        out_each = os.path.join(OUTPUT_DIR, f"{train_name}_features_raw.csv")
+        df.to_csv(out_each, index=False, encoding="utf-8-sig")
+        print(f"저장 완료: {out_each}")
+        print(f"{train_name}: {df.shape[0]} rows x {df.shape[1]} cols")
+
+        all_dfs.append(df)
+
+    if not all_dfs:
+        print("처리된 데이터가 없습니다.")
+        return
+
+    all_df = pd.concat(all_dfs, ignore_index=True)
+
+    # 통합 후 train별 상대 feature, SI, trend 생성
+    all_df = add_si_and_relative_features(all_df)
+    all_df = add_trend_features(all_df)
+
+    # 컬럼 순서 정리
+    meta_cols = [
+        "train_id",
+        "file_index",
+        "file_name",
+        "time_start_sec",
+        "time_end_sec",
+        "failure_time_sec_tdms",
+        "RUL_sec",
+        "op_time_sec",
+        "op_rpm_mean",
+        "rpm_group",
+        "op_torque_mean",
+        "op_temp_front",
+        "op_temp_rear",
+        "V_norm",
+        "T_norm",
+        "Tor_norm",
+        "SI",
+    ]
+
+    meta_cols = [c for c in meta_cols if c in all_df.columns]
+    feat_cols = [c for c in all_df.columns if c not in meta_cols]
+    all_df = all_df[meta_cols + feat_cols]
+
+    out_all = os.path.join(OUTPUT_DIR, "ALL_train_features_final.csv")
+    all_df.to_csv(out_all, index=False, encoding="utf-8-sig")
+
+    print("\n전체 완료")
+    print(f"저장 파일: {out_all}")
+    print(f"최종 크기: {all_df.shape[0]} rows x {all_df.shape[1]} cols")
+
+    # 간단 검증용 출력
+    print("\n핵심 컬럼 확인")
+    check_cols = [
+        "train_id", "file_index", "RUL_sec", "op_rpm_mean",
+        "rms_all_mean", "V_norm", "T_norm", "Tor_norm", "SI",
+        "CH1_bpfi_h1_energy_ratio", "CH1_bpfo_h1_energy_ratio",
+        "rms_all_mean_slope_6", "op_temp_front_slope_6"
+    ]
+    check_cols = [c for c in check_cols if c in all_df.columns]
+    print(all_df[check_cols].head(10))
+
+
+if __name__ == "__main__":
+    main()
